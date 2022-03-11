@@ -399,17 +399,6 @@ static void handle_local_packet(void) {
         }
     }
 
-    //int query_timerfd = new_once_timerfd(g_upstream_timeout_sec);
-
-#ifdef __linux__
-    // struct epoll_event ev = {.events = EPOLLIN, .data.u32 = (unique_msgid << BIT_SHIFT_LEN) | TIMER_FD_MARK};
-    // if (epoll_ctl(g_event_fd, EPOLL_CTL_ADD, query_timerfd, &ev)) {
-    //     LOGERR("[handle_local_packet] failed to register timeout event: (%d) %s", errno, strerror(errno));
-    //     close(query_timerfd);
-    //     return;
-    // }
-#endif
-
     queryctx_t *context = malloc(sizeof(queryctx_t));
     context->unique_msgid = unique_msgid;
     context->origin_msgid = origin_msgid;
@@ -517,86 +506,6 @@ SEND_REPLY:
 //
 void doevent(void)
 {
-#ifdef __linux__
-	struct epoll_event events[MAX_EVENTS];
-	int rc;
-	int i;
-	int fd;
-	int j;
-	bilisock_t *bs;
-    uint32_t curr_data;
-
-	for(j = 0; j < 30; j++)
-	{
-		rc = epoll_wait(event_ident, events, MAX_EVENTS, 0);
-		
-		if (rc == 0 || rc < 0)
-			return;
-
-		realtime = GetTime();
-
-		for (i = 0;i < rc; i++)
-		{
-			fd = events[i].data.fd;
-
-			if (fd == -1)
-				continue;
-
-            if(event_watchers[fd] && events[i].events & EPOLLERR) {
-                curr_data = event_watchers[fd]->u32;
-                /* an error occurred */
-                switch (curr_data & IDX_MARK_MASK) {
-                    case CHINADNS1_IDX:
-                        LOGERR("[main] upstream server socket error(%s): (%d) %s", g_remote_ipports[CHINADNS1_IDX], errno, strerror(errno));
-                        break;
-                    case CHINADNS2_IDX:
-                        LOGERR("[main] upstream server socket error(%s): (%d) %s", g_remote_ipports[CHINADNS2_IDX], errno, strerror(errno));
-                        break;
-                    case TRUSTDNS1_IDX:
-                        LOGERR("[main] upstream server socket error(%s): (%d) %s", g_remote_ipports[TRUSTDNS1_IDX], errno, strerror(errno));
-                        break;
-                    case TRUSTDNS2_IDX:
-                        LOGERR("[main] upstream server socket error(%s): (%d) %s", g_remote_ipports[TRUSTDNS2_IDX], errno, strerror(errno));
-                        break;
-                    case BINDSOCK_MARK:
-                        LOGERR("[main] local udp listen socket error: (%d) %s", errno, strerror(errno));
-                        break;
-                    case TIMER_FD_MARK:
-                        LOGERR("[main] query timeout timer fd error: (%d) %s", errno, strerror(errno));
-                        break;
-                }
-
-                continue;
-            }
-
-			if(event_watchers[fd] && events[i].events & EPOLLIN) {
-                curr_data = event_watchers[fd]->u32;
-                 /* handle readable event */
-                switch (curr_data & IDX_MARK_MASK) {
-                    case CHINADNS1_IDX:
-                        handle_remote_packet(CHINADNS1_IDX);
-                        break;
-                    case CHINADNS2_IDX:
-                        handle_remote_packet(CHINADNS2_IDX);
-                        break;
-                    case TRUSTDNS1_IDX:
-                        handle_remote_packet(TRUSTDNS1_IDX);
-                        break;
-                    case TRUSTDNS2_IDX:
-                        handle_remote_packet(TRUSTDNS2_IDX);
-                        break;
-                    case BINDSOCK_MARK:
-                        handle_local_packet();
-                        break;
-                    // case TIMER_FD_MARK:
-                    //     handle_timeout_event(curr_data >> BIT_SHIFT_LEN);
-                    //     break;
-                }
-                
-			}
-		}
-	}
-#elif defined(__FreeBSD__)
 	struct kevent events[MAX_EVENTS];
 	int rc;
 	int i;
@@ -668,14 +577,10 @@ void doevent(void)
                     case BINDSOCK_MARK:
                         handle_local_packet();
                         break;
-                    // case TIMER_FD_MARK:
-                    //     handle_timeout_event(curr_data >> BIT_SHIFT_LEN);
-                    //     break;
                 }
 			}
 		}
 	}
-#endif
 }
 
 

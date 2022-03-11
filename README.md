@@ -1,5 +1,6 @@
 # ChinaDNS-NG
 [ChinaDNS](https://github.com/shadowsocks/ChinaDNS) 的个人重构版本，功能简述：
+- FreeBSD 或 pfSense 专用版本
 - 删除原版chinadns-ng的iplink支持，使用FreeBSD内核的radix树来实现ip地址判断，现在中国ip列表根据chnroute文件来识别
 - 完整支持 IPv4 和 IPv6 协议，兼容 EDNS 请求和响应。
 - 手动指定国内 DNS 和可信 DNS，而非自动识别，更加可控。
