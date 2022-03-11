@@ -4,12 +4,23 @@
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stdbool.h>
-#include <endian.h>
+#include <sys/endian.h>
 #include <sys/types.h>
 #undef _GNU_SOURCE
 
+#ifdef __FreeBSD__
+#if !(defined(_BYTE_ORDER) && defined(_LITTLE_ENDIAN) && defined(_BIG_ENDIAN))
+  #error "_BYTE_ORDER or _LITTLE_ENDIAN or _BIG_ENDIAN not defined"
+#endif
+#define __BYTE_ORDER _BYTE_ORDER
+#define __LITTLE_ENDIAN _LITTLE_ENDIAN
+#define __BIG_ENDIAN _BIG_ENDIAN
+#endif
+
+#ifdef __linux__
 #if !(defined(__BYTE_ORDER) && defined(__LITTLE_ENDIAN) && defined(__BIG_ENDIAN))
   #error "__BYTE_ORDER or __LITTLE_ENDIAN or __BIG_ENDIAN not defined"
+#endif
 #endif
 
 /* dns packet max size (in bytes) */

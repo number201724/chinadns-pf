@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 set -o errexit
 set -o pipefail
 url='https://raw.github.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf'

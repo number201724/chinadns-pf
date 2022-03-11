@@ -1,26 +1,18 @@
-CC = gcc
+
+CC = cc
 CFLAGS = -std=c99 -Wall -Wextra -O2
-SRCS = chinadns.c dnsutils.c dnlutils.c netutils.c
+
+TARGET = chinadns-ng
+SRCS = chinadns.c dnsutils.c dnlutils.c netutils.c realtime.c timer.c event.c radix.c
 OBJS = $(SRCS:.c=.o)
-MAIN = chinadns-ng
-DESTDIR = /usr/local/bin
 
-.PHONY: all install uninstall clean
+all: $(TARGET)
 
-all: $(MAIN)
-
-install: $(MAIN)
-	install -d $(DESTDIR)
-	install -m 0755 $(MAIN) $(DESTDIR)
-
-uninstall:
-	$(RM) $(DESTDIR)/$(MAIN)
+depend:
+	mkdep ${CFLAGS} ${SRCS}
 
 clean:
-	$(RM) *.o $(MAIN)
+	rm -rf *.o ${TARGET}
 
-$(MAIN): $(OBJS)
-	$(CC) $(CFLAGS) -s -o $(MAIN) $(OBJS)
-
-.c.o:
-	$(CC) $(CFLAGS) -c $< -o $@
+${TARGET}: ${OBJS}
+	${CC} -s -o ${TARGET} ${OBJS}

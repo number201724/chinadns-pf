@@ -1,4 +1,4 @@
-#define _GNU_SOURCE
+#include "pch.h"
 #include "chinadns.h"
 #include "logutils.h"
 #include "netutils.h"
@@ -17,10 +17,12 @@
 #include <getopt.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/epoll.h>
+#include "realtime.h"
+#include "timer.h"
+#include "event.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#undef _GNU_SOURCE
+#include <err.h>
 
 /* limits.h */
 #ifndef PATH_MAX
@@ -33,7 +35,7 @@
 #define TRUSTDNS1_IDX 2
 #define TRUSTDNS2_IDX 3
 #define BINDSOCK_MARK 4
-#define TIMER_FD_MARK 5
+// #define TIMER_FD_MARK 5
 #define BIT_SHIFT_LEN 16
 #define IDX_MARK_MASK 0xffff
 
@@ -52,7 +54,8 @@
 typedef struct {
     uint16_t   unique_msgid;  /* [key] globally unique msgid */
     uint16_t   origin_msgid;  /* [value] associated original msgid */
-    int        query_timerfd; /* [value] dns query timeout timer-fd */
+    htimer_t    query_timer;
+    // int        query_timerfd; /* [value] dns query timeout timer-fd */
     void      *trustdns_buf;  /* [value] storage reply from trust-dns */
     bool       chinadns_got;  /* [value] received reply from china-dns */
     uint8_t    dnlmatch_ret;  /* [value] dnl_ismatch(dname) ret-value */
@@ -60,8 +63,9 @@ typedef struct {
     myhash_hh  hh;            /* [metadata] used internally by `uthash` */
 } queryctx_t;
 
+uint64_t realtime;
+
 /* static global variable declaration */
-static int         g_epollfd                                          = -1;
 static bool        g_verbose                                          = false;
 static bool        g_reuse_port                                       = false;
 static bool        g_fair_mode                                        = false; /* default: fast-mode */
@@ -77,7 +81,9 @@ static char        g_bind_ipstr[INET6_ADDRSTRLEN]                     = "127.0.0
 static portno_t    g_bind_portno                                      = 65353;
 static skaddr6_t   g_bind_skaddr                                      = {0};
 static int         g_bind_sockfd                                      = -1;
+static event_io_t  g_bind_sockfd_event;  
 static int         g_remote_sockfds[SERVER_MAXCOUNT]                  = {-1, -1, -1, -1};
+static event_io_t  g_remote_sockfds_events[SERVER_MAXCOUNT];  
 static char        g_remote_ipports[SERVER_MAXCOUNT][ADDRPORT_STRLEN] = {"114.114.114.114#53", "", "8.8.8.8#53", ""};
 static skaddr6_t   g_remote_skaddrs[SERVER_MAXCOUNT]                  = {{0}};
 static char        g_socket_buffer[SOCKBUFF_MAXSIZE]                  = {0};
@@ -293,10 +299,12 @@ static void parse_command_args(int argc, char *argv[]) {
                 goto PRINT_HELP_AND_EXIT;
         }
     }
+    
     if (g_gfwlist_fname && g_chnlist_fname && !strcmp(g_gfwlist_fname, "-") && !strcmp(g_chnlist_fname, "-")) {
         printf("[parse_command_args] gfwlist:%s and chnlist:%s are both STDIN\n", g_gfwlist_fname, g_chnlist_fname);
         goto PRINT_HELP_AND_EXIT;
     }
+
     build_socket_addr(get_ipstr_family(g_bind_ipstr), &g_bind_skaddr, g_bind_ipstr, g_bind_portno);
     if (chinadns_optarg) {
         char dnsserver_optstring[strlen(chinadns_optarg) + 1];
@@ -316,6 +324,21 @@ static void parse_command_args(int argc, char *argv[]) {
 PRINT_HELP_AND_EXIT:
     print_command_help();
     exit(1);
+}
+
+
+/* handle upstream reply timeout event */
+static void handle_timeout_event(htimer_t *timer) {
+    queryctx_t *context = NULL;
+    context = timer->data;
+    MYHASH_GET(g_query_context_hashtbl, context, &context->unique_msgid, sizeof(context->unique_msgid));
+    if (!context) return; /* due to timing issues, the query context has actually been released */
+    LOGERR("[handle_timeout_event] upstream dns server reply timeout, unique msgid: %hu", context->unique_msgid);
+    MYHASH_DEL(g_query_context_hashtbl, context); /* delete query context from the hashtable */
+    timer_stop(&context->query_timer);
+    // close(context->query_timerfd); /* epoll will automatically remove the associated event */
+    free(context->trustdns_buf); /* release the buffer that stores the trust-dns reply */
+    free(context);
 }
 
 /* handle local socket readable event */
@@ -376,18 +399,24 @@ static void handle_local_packet(void) {
         }
     }
 
-    int query_timerfd = new_once_timerfd(g_upstream_timeout_sec);
-    struct epoll_event ev = {.events = EPOLLIN, .data.u32 = (unique_msgid << BIT_SHIFT_LEN) | TIMER_FD_MARK};
-    if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, query_timerfd, &ev)) {
-        LOGERR("[handle_local_packet] failed to register timeout event: (%d) %s", errno, strerror(errno));
-        close(query_timerfd);
-        return;
-    }
+    //int query_timerfd = new_once_timerfd(g_upstream_timeout_sec);
+
+#ifdef __linux__
+    // struct epoll_event ev = {.events = EPOLLIN, .data.u32 = (unique_msgid << BIT_SHIFT_LEN) | TIMER_FD_MARK};
+    // if (epoll_ctl(g_event_fd, EPOLL_CTL_ADD, query_timerfd, &ev)) {
+    //     LOGERR("[handle_local_packet] failed to register timeout event: (%d) %s", errno, strerror(errno));
+    //     close(query_timerfd);
+    //     return;
+    // }
+#endif
 
     queryctx_t *context = malloc(sizeof(queryctx_t));
     context->unique_msgid = unique_msgid;
     context->origin_msgid = origin_msgid;
-    context->query_timerfd = query_timerfd;
+    context->query_timer.data = context;
+    timer_init(&context->query_timer);
+    timer_start(&context->query_timer, handle_timeout_event, g_upstream_timeout_sec*1000,g_upstream_timeout_sec*1000);
+    // context->query_timerfd = query_timerfd;
     context->trustdns_buf = NULL;
     context->chinadns_got = !g_fair_mode;
     context->dnlmatch_ret = dnlmatch_ret;
@@ -476,108 +505,45 @@ SEND_REPLY:
         LOGERR("[handle_remote_packet] failed to send dns reply packet to %s#%hu: (%d) %s", g_ipaddrstring_buffer, source_port, errno, strerror(errno));
     }
     MYHASH_DEL(g_query_context_hashtbl, context);
-    close(context->query_timerfd);
+    timer_stop(&context->query_timer);
     free(context->trustdns_buf);
     free(context);
 }
 
-/* handle upstream reply timeout event */
-static void handle_timeout_event(uint16_t msg_id) {
-    queryctx_t *context = NULL;
-    MYHASH_GET(g_query_context_hashtbl, context, &msg_id, sizeof(msg_id));
-    if (!context) return; /* due to timing issues, the query context has actually been released */
-    LOGERR("[handle_timeout_event] upstream dns server reply timeout, unique msgid: %hu", msg_id);
-    MYHASH_DEL(g_query_context_hashtbl, context); /* delete query context from the hashtable */
-    close(context->query_timerfd); /* epoll will automatically remove the associated event */
-    free(context->trustdns_buf); /* release the buffer that stores the trust-dns reply */
-    free(context);
-}
 
-int main(int argc, char *argv[]) {
-    signal(SIGPIPE, SIG_IGN);
-    setvbuf(stdout, NULL, _IOLBF, 256);
-    parse_command_args(argc, argv);
 
-    /* show startup information */
-    LOGINF("[main] local listen addr: %s#%hu", g_bind_ipstr, g_bind_portno);
-    if (strlen(g_remote_ipports[CHINADNS1_IDX])) LOGINF("[main] chinadns server#1: %s", g_remote_ipports[CHINADNS1_IDX]);
-    if (strlen(g_remote_ipports[CHINADNS2_IDX])) LOGINF("[main] chinadns server#2: %s", g_remote_ipports[CHINADNS2_IDX]);
-    if (strlen(g_remote_ipports[TRUSTDNS1_IDX])) LOGINF("[main] trustdns server#1: %s", g_remote_ipports[TRUSTDNS1_IDX]);
-    if (strlen(g_remote_ipports[TRUSTDNS2_IDX])) LOGINF("[main] trustdns server#2: %s", g_remote_ipports[TRUSTDNS2_IDX]);
-    LOGINF("[main] ipset ip4 setname: %s", g_ipset_setname4);
-    LOGINF("[main] ipset ip6 setname: %s", g_ipset_setname6);
-    LOGINF("[main] dns query timeout: %ld seconds", g_upstream_timeout_sec);
-    if (g_gfwlist_fname) LOGINF("[main] gfwlist entries count: %zu", dnl_init(g_gfwlist_fname, true));
-    if (g_chnlist_fname) LOGINF("[main] chnlist entries count: %zu", dnl_init(g_chnlist_fname, false));
-    if (g_gfwlist_fname && g_chnlist_fname) LOGINF("[main] %s have higher priority", g_gfwlist_first ? "gfwlist" : "chnlist");
-    if (g_repeat_times > 1) LOGINF("[main] enable repeat mode, times: %hhu", g_repeat_times);
-    LOGINF("[main] %s reply without ip addr", g_noip_as_chnip ? "accept" : "filter");
-    LOGINF("[main] cur judgment mode: %s mode", g_fair_mode ? "fair" : "fast");
-    if (g_no_ipv6_query) LOGINF("[main] filter ipv6-address dns-query");
-    if (g_reuse_port) LOGINF("[main] enable `SO_REUSEPORT` feature");
-    if (g_verbose) LOGINF("[main] print the verbose running log");
+//
+// Purpose: 
+//
+void doevent(void)
+{
+#ifdef __linux__
+	struct epoll_event events[MAX_EVENTS];
+	int rc;
+	int i;
+	int fd;
+	int j;
+	bilisock_t *bs;
+    uint32_t curr_data;
 
-    /* init ipset netlink socket */
-    ipset_init_nlsocket();
+	for(j = 0; j < 30; j++)
+	{
+		rc = epoll_wait(event_ident, events, MAX_EVENTS, 0);
+		
+		if (rc == 0 || rc < 0)
+			return;
 
-    /* create listen socket */
-    g_bind_sockfd = new_udp_socket(g_bind_skaddr.sin6_family);
-    if (g_reuse_port) set_reuse_port(g_bind_sockfd);
+		realtime = GetTime();
 
-    /* create remote socket */
-    for (int i = 0; i < SERVER_MAXCOUNT; ++i) {
-        if (!strlen(g_remote_ipports[i])) continue;
-        g_remote_sockfds[i] = new_udp_socket(g_remote_skaddrs[i].sin6_family);
-    }
+		for (i = 0;i < rc; i++)
+		{
+			fd = events[i].data.fd;
 
-    /* bind address to listen socket */
-    if (bind(g_bind_sockfd, (void *)&g_bind_skaddr, (g_bind_skaddr.sin6_family == AF_INET) ? sizeof(skaddr4_t) : sizeof(skaddr6_t))) {
-        LOGERR("[main] failed to bind address to socket: (%d) %s", errno, strerror(errno));
-        return errno;
-    }
+			if (fd == -1)
+				continue;
 
-    /* create epoll fd */
-    if ((g_epollfd = epoll_create1(0)) < 0) {
-        LOGERR("[main] failed to create epoll fd: (%d) %s", errno, strerror(errno));
-        return errno;
-    }
-
-    /* register epoll event */
-    struct epoll_event ev, events[EPOLL_MAXEVENTS];
-
-    /* listen socket readable event */
-    ev.events = EPOLLIN;
-    ev.data.u32 = BINDSOCK_MARK; /* don't care about msg id */
-    if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, g_bind_sockfd, &ev)) {
-        LOGERR("[main] failed to register epoll event: (%d) %s", errno, strerror(errno));
-        return errno;
-    }
-
-    /* remote socket readable event */
-    for (int i = 0; i < SERVER_MAXCOUNT; ++i) {
-        if (g_remote_sockfds[i] < 0) continue;
-        ev.events = EPOLLIN;
-        ev.data.u32 = i; /* don't care about msg id */
-        if (epoll_ctl(g_epollfd, EPOLL_CTL_ADD, g_remote_sockfds[i], &ev)) {
-            LOGERR("[main] failed to register epoll event: (%d) %s", errno, strerror(errno));
-            return errno;
-        }
-    }
-
-    /* run event loop (blocking here) */
-    while (true) {
-        int event_count = epoll_wait(g_epollfd, events, EPOLL_MAXEVENTS, -1);
-
-        if (event_count < 0) {
-            LOGERR("[main] epoll_wait() reported an error: (%d) %s", errno, strerror(errno));
-            continue;
-        }
-
-        for (int i = 0; i < event_count; ++i) {
-            uint32_t curr_event = events[i].events;
-            uint32_t curr_data = events[i].data.u32;
-
-            if (curr_event & EPOLLERR) {
+            if(event_watchers[fd] && events[i].events & EPOLLERR) {
+                curr_data = event_watchers[fd]->u32;
                 /* an error occurred */
                 switch (curr_data & IDX_MARK_MASK) {
                     case CHINADNS1_IDX:
@@ -599,8 +565,13 @@ int main(int argc, char *argv[]) {
                         LOGERR("[main] query timeout timer fd error: (%d) %s", errno, strerror(errno));
                         break;
                 }
-            } else if (curr_event & EPOLLIN) {
-                /* handle readable event */
+
+                continue;
+            }
+
+			if(event_watchers[fd] && events[i].events & EPOLLIN) {
+                curr_data = event_watchers[fd]->u32;
+                 /* handle readable event */
                 switch (curr_data & IDX_MARK_MASK) {
                     case CHINADNS1_IDX:
                         handle_remote_packet(CHINADNS1_IDX);
@@ -617,12 +588,175 @@ int main(int argc, char *argv[]) {
                     case BINDSOCK_MARK:
                         handle_local_packet();
                         break;
-                    case TIMER_FD_MARK:
-                        handle_timeout_event(curr_data >> BIT_SHIFT_LEN);
-                        break;
+                    // case TIMER_FD_MARK:
+                    //     handle_timeout_event(curr_data >> BIT_SHIFT_LEN);
+                    //     break;
+                }
+                
+			}
+		}
+	}
+#elif defined(__FreeBSD__)
+	struct kevent events[MAX_EVENTS];
+	int rc;
+	int i;
+	int fd;
+	int j;
+	struct timespec ts;
+    uint32_t curr_data;
+
+	memset(&ts, 0, sizeof(ts));
+
+	for(j = 0; j < 30; j++)
+	{
+		rc = kevent(event_ident, NULL, 0, events, MAX_EVENTS, &ts);
+		
+		if (rc == 0 || rc < 0)
+			return;
+
+		realtime = GetTime();
+
+		for (i = 0;i < rc; i++)
+		{
+			fd = events[i].ident;
+
+			if (fd == -1)
+				continue;
+			
+            if(event_watchers[fd] && events[i].flags & EV_EOF) {
+                if(events[i].fflags != 0) {
+                    errno = (int)events[i].fflags;
+                    curr_data = event_watchers[fd]->u32;
+                    /* an error occurred */
+                    switch (curr_data & IDX_MARK_MASK) {
+                        case CHINADNS1_IDX:
+                            LOGERR("[main] upstream server socket error(%s): (%d) %s", g_remote_ipports[CHINADNS1_IDX], errno, strerror(errno));
+                            break;
+                        case CHINADNS2_IDX:
+                            LOGERR("[main] upstream server socket error(%s): (%d) %s", g_remote_ipports[CHINADNS2_IDX], errno, strerror(errno));
+                            break;
+                        case TRUSTDNS1_IDX:
+                            LOGERR("[main] upstream server socket error(%s): (%d) %s", g_remote_ipports[TRUSTDNS1_IDX], errno, strerror(errno));
+                            break;
+                        case TRUSTDNS2_IDX:
+                            LOGERR("[main] upstream server socket error(%s): (%d) %s", g_remote_ipports[TRUSTDNS2_IDX], errno, strerror(errno));
+                            break;
+                        case BINDSOCK_MARK:
+                            LOGERR("[main] local udp listen socket error: (%d) %s", errno, strerror(errno));
+                            break;
+                    }
+                    continue;
                 }
             }
+
+			if(event_watchers[fd] && events[i].filter == EVFILT_READ) {
+                curr_data = event_watchers[fd]->u32;
+                 /* handle readable event */
+                switch (curr_data & IDX_MARK_MASK) {
+                    case CHINADNS1_IDX:
+                        handle_remote_packet(CHINADNS1_IDX);
+                        break;
+                    case CHINADNS2_IDX:
+                        handle_remote_packet(CHINADNS2_IDX);
+                        break;
+                    case TRUSTDNS1_IDX:
+                        handle_remote_packet(TRUSTDNS1_IDX);
+                        break;
+                    case TRUSTDNS2_IDX:
+                        handle_remote_packet(TRUSTDNS2_IDX);
+                        break;
+                    case BINDSOCK_MARK:
+                        handle_local_packet();
+                        break;
+                    // case TIMER_FD_MARK:
+                    //     handle_timeout_event(curr_data >> BIT_SHIFT_LEN);
+                    //     break;
+                }
+			}
+		}
+	}
+#endif
+}
+
+
+int main(int argc, char *argv[]) {
+    signal(SIGPIPE, SIG_IGN);
+    setvbuf(stdout, NULL, _IOLBF, 256);
+    parse_command_args(argc, argv);
+
+    /* show startup information */
+    LOGINF("[main] local listen addr: %s#%hu", g_bind_ipstr, g_bind_portno);
+    if (strlen(g_remote_ipports[CHINADNS1_IDX]))
+        LOGINF("[main] chinadns server#1: %s", g_remote_ipports[CHINADNS1_IDX]);
+    if (strlen(g_remote_ipports[CHINADNS2_IDX]))
+        LOGINF("[main] chinadns server#2: %s", g_remote_ipports[CHINADNS2_IDX]);
+    if (strlen(g_remote_ipports[TRUSTDNS1_IDX]))
+        LOGINF("[main] trustdns server#1: %s", g_remote_ipports[TRUSTDNS1_IDX]);
+
+    if (strlen(g_remote_ipports[TRUSTDNS2_IDX])) {
+        LOGINF("[main] trustdns server#2: %s", g_remote_ipports[TRUSTDNS2_IDX]);
+    }
+    LOGINF("[main] ipset ip4 setname: %s", g_ipset_setname4);
+    LOGINF("[main] ipset ip6 setname: %s", g_ipset_setname6);
+    LOGINF("[main] dns query timeout: %ld seconds", g_upstream_timeout_sec);
+    if (g_gfwlist_fname) LOGINF("[main] gfwlist entries count: %zu", dnl_init(g_gfwlist_fname, true));
+    if (g_chnlist_fname) LOGINF("[main] chnlist entries count: %zu", dnl_init(g_chnlist_fname, false));
+    if (g_gfwlist_fname && g_chnlist_fname) LOGINF("[main] %s have higher priority", g_gfwlist_first ? "gfwlist" : "chnlist");
+    if (g_repeat_times > 1) LOGINF("[main] enable repeat mode, times: %hhu", g_repeat_times);
+    LOGINF("[main] %s reply without ip addr", g_noip_as_chnip ? "accept" : "filter");
+    LOGINF("[main] cur judgment mode: %s mode", g_fair_mode ? "fair" : "fast");
+    if (g_no_ipv6_query) LOGINF("[main] filter ipv6-address dns-query");
+    if (g_reuse_port) LOGINF("[main] enable `SO_REUSEPORT` feature");
+    if (g_verbose) LOGINF("[main] print the verbose running log");
+
+    event_init();
+
+    /* init ipset netlink socket */
+    chnroute_init();
+
+    /* create listen socket */
+    g_bind_sockfd = new_udp_socket(g_bind_skaddr.sin6_family);
+    if (g_reuse_port) set_reuse_port(g_bind_sockfd);
+
+    /* create remote socket */
+    for (int i = 0; i < SERVER_MAXCOUNT; ++i) {
+        if (!strlen(g_remote_ipports[i])) continue;
+        g_remote_sockfds[i] = new_udp_socket(g_remote_skaddrs[i].sin6_family);
+    }
+
+    /* bind address to listen socket */
+    if (bind(g_bind_sockfd, (void *)&g_bind_skaddr, (g_bind_skaddr.sin6_family == AF_INET) ? sizeof(skaddr4_t) : sizeof(skaddr6_t))) {
+        LOGERR("[main] failed to bind address to socket: (%d) %s", errno, strerror(errno));
+        return errno;
+    }
+
+    g_bind_sockfd_event.u32 = BINDSOCK_MARK;
+
+    if (event_add(g_bind_sockfd, &g_bind_sockfd_event)) {
+        LOGERR("[main] failed to register to event: (%d) %s", errno, strerror(errno));
+        return errno;
+    }
+
+
+    /* remote socket readable event */
+    for (int i = 0; i < SERVER_MAXCOUNT; ++i) {
+        if (g_remote_sockfds[i] < 0)
+            continue;
+
+        g_remote_sockfds_events[i].u32 = i;
+
+        if(event_add(g_remote_sockfds[i], &g_remote_sockfds_events[i])) {
+            LOGERR("[main] failed to register to event: (%d) %s", errno, strerror(errno));
+             return errno;
         }
+    }
+
+    /* run event loop (blocking here) */
+    while (true) {
+        realtime = GetTime();
+        doevent();
+        realtime = GetTime();
+        run_timers();
     }
 
     return 0;

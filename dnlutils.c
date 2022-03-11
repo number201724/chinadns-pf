@@ -1,12 +1,12 @@
 #define _GNU_SOURCE
-#include "dnlutils.h"
-#include "dnsutils.h"
-#include "logutils.h"
-#include "uthash.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include "dnlutils.h"
+#include "dnsutils.h"
+#include "logutils.h"
+#include "uthash.h"
 #undef _GNU_SOURCE
 
 /* a very simple memory pool (alloc only) */
