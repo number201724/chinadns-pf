@@ -662,6 +662,7 @@ int main(int argc, char *argv[]) {
         doevent();
         realtime = GetTime();
         run_timers();
+        usleep(1000);
     }
 
     return 0;
