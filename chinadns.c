@@ -331,8 +331,8 @@ PRINT_HELP_AND_EXIT:
 static void handle_timeout_event(htimer_t *timer) {
     queryctx_t *context = NULL;
     context = timer->data;
-    MYHASH_GET(g_query_context_hashtbl, context, &context->unique_msgid, sizeof(context->unique_msgid));
-    if (!context) return; /* due to timing issues, the query context has actually been released */
+    //MYHASH_GET(g_query_context_hashtbl, context, &context->unique_msgid, sizeof(context->unique_msgid));
+    //if (!context) return; /* due to timing issues, the query context has actually been released */
     LOGERR("[handle_timeout_event] upstream dns server reply timeout, unique msgid: %hu", context->unique_msgid);
     MYHASH_DEL(g_query_context_hashtbl, context); /* delete query context from the hashtable */
     timer_stop(&context->query_timer);
